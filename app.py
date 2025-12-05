@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # Change this to your actual filename in the repo
-MODEL_PATH = "webphish_lite_pp.pth"  # e.g. "checkpoint_webphish.pth"
+MODEL_PATH = "webphish_lite_complete.pth"  # e.g. "checkpoint_webphish.pth"
 
 DEVICE = torch.device("cpu")
 
