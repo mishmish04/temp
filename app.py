@@ -14,18 +14,16 @@ st.set_page_config(
     layout="centered",
 )
 
-MODEL_PATH = "webphish_lite_complete.pth"  # put your .pth file next to this app.py
+# Change this to your actual filename in the repo
+MODEL_PATH = "webphish_lite_pp.pth"  # e.g. "checkpoint_webphish.pth"
 
 DEVICE = torch.device("cpu")
 
 # =========================
 # 1. MODEL DEFINITION
 # =========================
-# IMPORTANT:
-# Paste your exact model class from the notebook here and make sure the class
-# name matches what you used when saving.
-#
-# Example structure (REPLACE with your real implementation):
+# Paste the exact same architecture you used during training.
+# This example follows your described architecture.
 
 class WebPhishLitePP(nn.Module):
     def __init__(
@@ -46,7 +44,8 @@ class WebPhishLitePP(nn.Module):
 
         self.gelu = nn.GELU()
         self.maxpool = nn.MaxPool1d(kernel_size=2)
-        self.layernorm = nn.LayerNorm(96)  # 32 * 3
+        # 32 filters * 3 kernels = 96
+        self.layernorm = nn.LayerNorm(96)
         self.dropout = nn.Dropout(0.3)
 
         self.fc1 = nn.Linear(96, 128)
@@ -74,6 +73,7 @@ class WebPhishLitePP(nn.Module):
         x = torch.cat([x3, x5, x7], dim=1)  # (B, 96, L)
 
         x = self.maxpool(x)                 # (B, 96, L/2)
+
         # Global average over sequence
         x = x.mean(dim=-1)                  # (B, 96)
 
@@ -85,27 +85,58 @@ class WebPhishLitePP(nn.Module):
 
 
 # =========================
-# 2. MODEL LOADING
+# 2. GLOBAL HYPERPARAMS (WILL BE OVERRIDDEN FROM CKPT)
+# =========================
+
+URL_MAX_LEN = 200
+HTML_MAX_LEN = 2000
+URL_VOCAB_SIZE = 256
+HTML_VOCAB_SIZE = 50000
+EMBED_DIM = 16
+
+
+# =========================
+# 3. MODEL LOADING
 # =========================
 @st.cache_resource
 def load_model():
     """
-    Tries to load:
-    1) full model (torch.save(model, path))
-    2) state_dict (torch.save(model.state_dict(), path))
+    Handles both:
+    - full model saved via torch.save(model, path)
+    - checkpoint dict saved via torch.save({
+          "model_state_dict": model.state_dict(),
+          "char_vocab_size": ...,
+          "word_vocab_size": ...,
+          "url_len": ...,
+          "html_len": ...,
+          "char_emb_dim": ...,
+          "word_emb_dim": ...
+      }, path)
     """
-    # Try to load full model object
-    try:
-        model = torch.load(MODEL_PATH, map_location=DEVICE)
+    ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
+
+    # Case 1: full model object (no "model_state_dict" key)
+    if not (isinstance(ckpt, dict) and "model_state_dict" in ckpt):
+        model = ckpt
+        model.to(DEVICE)
         model.eval()
         return model
-    except Exception:
-        pass
 
-    # Fallback: assume state_dict and use the class above
-    model = WebPhishLitePP()
-    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-    model.load_state_dict(state_dict)
+    # Case 2: checkpoint dict (your logs show this case)
+    global URL_MAX_LEN, HTML_MAX_LEN, URL_VOCAB_SIZE, HTML_VOCAB_SIZE, EMBED_DIM
+
+    URL_VOCAB_SIZE = ckpt.get("char_vocab_size", URL_VOCAB_SIZE)
+    HTML_VOCAB_SIZE = ckpt.get("word_vocab_size", HTML_VOCAB_SIZE)
+    URL_MAX_LEN = ckpt.get("url_len", URL_MAX_LEN)
+    HTML_MAX_LEN = ckpt.get("html_len", HTML_MAX_LEN)
+    EMBED_DIM = ckpt.get("char_emb_dim", EMBED_DIM)  # assuming char_emb_dim == word_emb_dim
+
+    model = WebPhishLitePP(
+        url_vocab_size=URL_VOCAB_SIZE,
+        html_vocab_size=HTML_VOCAB_SIZE,
+        embed_dim=EMBED_DIM,
+    )
+    model.load_state_dict(ckpt["model_state_dict"])
     model.to(DEVICE)
     model.eval()
     return model
@@ -114,14 +145,8 @@ def load_model():
 model = load_model()
 
 # =========================
-# 3. PREPROCESSING
+# 4. PREPROCESSING
 # =========================
-
-URL_MAX_LEN = 200
-HTML_MAX_LEN = 2000
-URL_VOCAB_SIZE = 256
-HTML_VOCAB_SIZE = 50000
-
 
 def fetch_html(url: str) -> str:
     try:
@@ -144,8 +169,7 @@ def fetch_html(url: str) -> str:
 def encode_url(url: str):
     """
     Simple character-level encoding.
-    If your training code used a different mapping,
-    adapt this to match that mapping.
+    Make sure this matches what you used during training.
     """
     url = url.strip()
     # Ensure protocol so requests.get doesn't break
@@ -158,7 +182,7 @@ def encode_url(url: str):
         idx = ord(ch) if ord(ch) < URL_VOCAB_SIZE else 0
         ids.append(idx)
 
-    # pad / truncate
+    # pad / truncate to URL_MAX_LEN (will be set from ckpt)
     if len(ids) < URL_MAX_LEN:
         ids = ids + [0] * (URL_MAX_LEN - len(ids))
     else:
@@ -169,8 +193,8 @@ def encode_url(url: str):
 
 def encode_html(html: str):
     """
-    Basic whitespace token -> hashed index.
-    Adapt this to match your actual HTML tokenizer.
+    Very basic whitespace token -> hashed index.
+    Adapt this to your actual HTML tokenizer if needed.
     """
     tokens = html.split()
     ids = []
@@ -200,7 +224,7 @@ def predict(url: str):
 
 
 # =========================
-# 4. STREAMLIT UI
+# 5. STREAMLIT UI
 # =========================
 
 st.title("🕸️ WebPhish-Lite++")
@@ -209,6 +233,7 @@ st.subheader("Phishing Website Detection (URL + HTML)")
 st.markdown(
     """
 Enter a URL below and the model will:
+
 1. Fetch the HTML of the page  
 2. Encode the URL + HTML  
 3. Run them through your trained WebPhish-Lite++ model  
