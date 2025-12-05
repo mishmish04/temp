@@ -26,63 +26,61 @@ DEVICE = torch.device("cpu")
 # This example follows your described architecture.
 
 class WebPhishLitePP(nn.Module):
-    class WebPhishLitePP(nn.Module):
-        def __init__(
-                self,
-                url_vocab_size: int = 256,
-                html_vocab_size: int = 50000,
-                embed_dim: int = 32,  # ← FIXED: must be 32 to match checkpoint
-        ):
-            super().__init__()
+    def __init__(
+        self,
+        url_vocab_size: int = 256,
+        html_vocab_size: int = 50000,
+        embed_dim: int = 32,   # ← FIXED: must be 32 to match checkpoint
+    ):
+        super().__init__()
 
-            # URL + HTML embeddings
-            self.url_emb = nn.Embedding(url_vocab_size, embed_dim, padding_idx=0)
-            self.html_emb = nn.Embedding(html_vocab_size, embed_dim, padding_idx=0)
+        # URL + HTML embeddings
+        self.url_emb = nn.Embedding(url_vocab_size, embed_dim, padding_idx=0)
+        self.html_emb = nn.Embedding(html_vocab_size, embed_dim, padding_idx=0)
 
-            # Multi-kernel Conv1D block
-            # Each conv layer’s in_channels MUST MATCH embed_dim = 32
-            self.conv3 = nn.Conv1d(embed_dim, 32, kernel_size=3, padding=1)
-            self.conv5 = nn.Conv1d(embed_dim, 32, kernel_size=5, padding=2)
-            self.conv7 = nn.Conv1d(embed_dim, 32, kernel_size=7, padding=3)
+        # Multi-kernel Conv1D block
+        # Each conv layer’s in_channels MUST MATCH embed_dim = 32
+        self.conv3 = nn.Conv1d(embed_dim, 32, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv1d(embed_dim, 32, kernel_size=5, padding=2)
+        self.conv7 = nn.Conv1d(embed_dim, 32, kernel_size=7, padding=3)
 
-            self.gelu = nn.GELU()
-            self.maxpool = nn.MaxPool1d(kernel_size=2)
+        self.gelu = nn.GELU()
+        self.maxpool = nn.MaxPool1d(kernel_size=2)
 
-            # 32 filters × 3 kernel sizes → 96 channels
-            self.layernorm = nn.LayerNorm(96)
-            self.dropout = nn.Dropout(0.3)
+        # 32 filters × 3 kernel sizes → 96 channels
+        self.layernorm = nn.LayerNorm(96)
+        self.dropout = nn.Dropout(0.3)
 
-            self.fc1 = nn.Linear(96, 128)
-            self.fc2 = nn.Linear(128, 64)
-            self.out = nn.Linear(64, 1)
+        self.fc1 = nn.Linear(96, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.out = nn.Linear(64, 1)
 
-        def forward(self, url_ids, html_ids):
-            url_emb = self.url_emb(url_ids)  # (B, L_u, 32)
-            html_emb = self.html_emb(html_ids)  # (B, L_h, 32)
+    def forward(self, url_ids, html_ids):
+        url_emb = self.url_emb(url_ids)      # (B, L_u, 32)
+        html_emb = self.html_emb(html_ids)   # (B, L_h, 32)
 
-            # concatenate sequence dimension
-            x = torch.cat([url_emb, html_emb], dim=1)  # (B, L_total, 32)
+        # concatenate sequence dimension
+        x = torch.cat([url_emb, html_emb], dim=1)  # (B, L_total, 32)
 
-            # Conv1d expects: (batch, channels, length)
-            x = x.transpose(1, 2)  # now (B, 32, L_total)
+        # Conv1d expects: (batch, channels, length)
+        x = x.transpose(1, 2)  # now (B, 32, L_total)
 
-            x3 = self.gelu(self.conv3(x))  # (B, 32, L)
-            x5 = self.gelu(self.conv5(x))  # (B, 32, L)
-            x7 = self.gelu(self.conv7(x))  # (B, 32, L)
+        x3 = self.gelu(self.conv3(x))  # (B, 32, L)
+        x5 = self.gelu(self.conv5(x))  # (B, 32, L)
+        x7 = self.gelu(self.conv7(x))  # (B, 32, L)
 
-            # concat channels → 96 filters
-            x = torch.cat([x3, x5, x7], dim=1)  # (B, 96, L)
+        # concat channels → 96 filters
+        x = torch.cat([x3, x5, x7], dim=1)  # (B, 96, L)
 
-            x = self.maxpool(x)  # (B, 96, L/2)
-            x = x.mean(dim=-1)  # global avg → (B, 96)
+        x = self.maxpool(x)          # (B, 96, L/2)
+        x = x.mean(dim=-1)           # global avg → (B, 96)
 
-            x = self.layernorm(x)
-            x = self.dropout(self.gelu(self.fc1(x)))
-            x = self.dropout(self.gelu(self.fc2(x)))
-            logits = self.out(x)
+        x = self.layernorm(x)
+        x = self.dropout(self.gelu(self.fc1(x)))
+        x = self.dropout(self.gelu(self.fc2(x)))
+        logits = self.out(x)
 
-            return logits
-
+        return logits
 
 # =========================
 # 2. GLOBAL HYPERPARAMS (WILL BE OVERRIDDEN FROM CKPT)
