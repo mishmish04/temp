@@ -1,317 +1,244 @@
+# app.py
 import streamlit as st
 import torch
 import torch.nn as nn
 import requests
 from urllib.parse import urlparse
-import re
-import time
 
-# Set page config
+# =========================
+# 0. BASIC CONFIG
+# =========================
 st.set_page_config(
-    page_title="Phishing URL Detector",
-    page_icon="🛡️",
-    layout="centered"
+    page_title="WebPhish-Lite++",
+    page_icon="🕸️",
+    layout="centered",
 )
 
+MODEL_PATH = "webphish_lite_complete.pth"  # put your .pth file next to this app.py
 
-# Define the neural network architecture (should match your training)
-class URLClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size=128):
-        super(URLClassifier, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(hidden_size, 64)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(0.3)
-        self.fc3 = nn.Linear(64, 32)
-        self.relu3 = nn.ReLU()
-        self.fc4 = nn.Linear(32, 1)
-        self.sigmoid = nn.Sigmoid()
+DEVICE = torch.device("cpu")
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu1(x)
-        x = self.dropout1(x)
-        x = self.fc2(x)
-        x = self.relu2(x)
-        x = self.dropout2(x)
-        x = self.fc3(x)
-        x = self.relu3(x)
-        x = self.fc4(x)
-        x = self.sigmoid(x)
-        return x
+# =========================
+# 1. MODEL DEFINITION
+# =========================
+# IMPORTANT:
+# Paste your exact model class from the notebook here and make sure the class
+# name matches what you used when saving.
+#
+# Example structure (REPLACE with your real implementation):
+
+class WebPhishLitePP(nn.Module):
+    def __init__(
+        self,
+        url_vocab_size: int = 256,
+        html_vocab_size: int = 50000,
+        embed_dim: int = 16,
+    ):
+        super().__init__()
+        # URL + HTML embeddings
+        self.url_emb = nn.Embedding(url_vocab_size, embed_dim, padding_idx=0)
+        self.html_emb = nn.Embedding(html_vocab_size, embed_dim, padding_idx=0)
+
+        # Multi-kernel Conv1D block over concatenated embeddings
+        self.conv3 = nn.Conv1d(embed_dim, 32, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv1d(embed_dim, 32, kernel_size=5, padding=2)
+        self.conv7 = nn.Conv1d(embed_dim, 32, kernel_size=7, padding=3)
+
+        self.gelu = nn.GELU()
+        self.maxpool = nn.MaxPool1d(kernel_size=2)
+        self.layernorm = nn.LayerNorm(96)  # 32 * 3
+        self.dropout = nn.Dropout(0.3)
+
+        self.fc1 = nn.Linear(96, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.out = nn.Linear(64, 1)
+
+    def forward(self, url_ids, html_ids):
+        """
+        url_ids:  (batch, url_seq_len)  LongTensor
+        html_ids: (batch, html_seq_len) LongTensor
+        """
+        url_emb = self.url_emb(url_ids)    # (B, L_u, E)
+        html_emb = self.html_emb(html_ids) # (B, L_h, E)
+
+        # Concatenate along sequence dimension
+        x = torch.cat([url_emb, html_emb], dim=1)  # (B, L_u + L_h, E)
+
+        # Conv1d expects (B, C_in, L)
+        x = x.transpose(1, 2)  # (B, E, L)
+
+        x3 = self.gelu(self.conv3(x))
+        x5 = self.gelu(self.conv5(x))
+        x7 = self.gelu(self.conv7(x))
+
+        x = torch.cat([x3, x5, x7], dim=1)  # (B, 96, L)
+
+        x = self.maxpool(x)                 # (B, 96, L/2)
+        # Global average over sequence
+        x = x.mean(dim=-1)                  # (B, 96)
+
+        x = self.layernorm(x)
+        x = self.dropout(self.gelu(self.fc1(x)))
+        x = self.dropout(self.gelu(self.fc2(x)))
+        logits = self.out(x)                # (B, 1)
+        return logits
 
 
-# Feature extraction function
-def extract_features(url, html_content=None):
-    """Extract features from URL and HTML content"""
-    features = []
+# =========================
+# 2. MODEL LOADING
+# =========================
+@st.cache_resource
+def load_model():
+    """
+    Tries to load:
+    1) full model (torch.save(model, path))
+    2) state_dict (torch.save(model.state_dict(), path))
+    """
+    # Try to load full model object
+    try:
+        model = torch.load(MODEL_PATH, map_location=DEVICE)
+        model.eval()
+        return model
+    except Exception:
+        pass
 
-    # URL-based features
+    # Fallback: assume state_dict and use the class above
+    model = WebPhishLitePP()
+    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+    model.load_state_dict(state_dict)
+    model.to(DEVICE)
+    model.eval()
+    return model
+
+
+model = load_model()
+
+# =========================
+# 3. PREPROCESSING
+# =========================
+
+URL_MAX_LEN = 200
+HTML_MAX_LEN = 2000
+URL_VOCAB_SIZE = 256
+HTML_VOCAB_SIZE = 50000
+
+
+def fetch_html(url: str) -> str:
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(url, headers=headers, timeout=8)
+        resp.raise_for_status()
+        # Hard truncate to avoid extremely long pages
+        return resp.text[:50_000]
+    except Exception as e:
+        st.warning(f"Could not fetch HTML: {e}")
+        return ""
+
+
+def encode_url(url: str):
+    """
+    Simple character-level encoding.
+    If your training code used a different mapping,
+    adapt this to match that mapping.
+    """
+    url = url.strip()
+    # Ensure protocol so requests.get doesn't break
     parsed = urlparse(url)
+    if not parsed.scheme:
+        url = "http://" + url
 
-    # 1. URL length
-    features.append(len(url))
+    ids = []
+    for ch in url:
+        idx = ord(ch) if ord(ch) < URL_VOCAB_SIZE else 0
+        ids.append(idx)
 
-    # 2. Number of dots
-    features.append(url.count('.'))
+    # pad / truncate
+    if len(ids) < URL_MAX_LEN:
+        ids = ids + [0] * (URL_MAX_LEN - len(ids))
+    else:
+        ids = ids[:URL_MAX_LEN]
 
-    # 3. Number of hyphens
-    features.append(url.count('-'))
-
-    # 4. Number of underscores
-    features.append(url.count('_'))
-
-    # 5. Number of slashes
-    features.append(url.count('/'))
-
-    # 6. Number of @ symbols
-    features.append(url.count('@'))
-
-    # 7. Has IP address
-    features.append(1 if re.search(r'\d+\.\d+\.\d+\.\d+', url) else 0)
-
-    # 8. HTTPS
-    features.append(1 if parsed.scheme == 'https' else 0)
-
-    # 9. Domain length
-    features.append(len(parsed.netloc))
-
-    # 10. Number of subdomains
-    features.append(parsed.netloc.count('.'))
-
-    # 11-15. Suspicious keywords
-    suspicious_words = ['login', 'verify', 'account', 'update', 'secure']
-    for word in suspicious_words:
-        features.append(1 if word in url.lower() else 0)
-
-    # 16. Has port
-    features.append(1 if ':' in parsed.netloc and '@' not in parsed.netloc else 0)
-
-    # 17. Path length
-    features.append(len(parsed.path))
-
-    # 18. Number of digits in URL
-    features.append(sum(c.isdigit() for c in url))
-
-    # 19. Number of parameters
-    features.append(len(parsed.query.split('&')) if parsed.query else 0)
-
-    # 20. TLD length
-    tld = parsed.netloc.split('.')[-1] if '.' in parsed.netloc else ''
-    features.append(len(tld))
-
-    return features
+    return torch.tensor([ids], dtype=torch.long, device=DEVICE), url
 
 
-# Custom CSS
-st.markdown("""
-    <style>
-    .main {
-        padding: 2rem;
-    }
-    .stAlert {
-        margin-top: 1rem;
-    }
-    .big-font {
-        font-size: 24px !important;
-        font-weight: bold;
-    }
-    .metric-container {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+def encode_html(html: str):
+    """
+    Basic whitespace token -> hashed index.
+    Adapt this to match your actual HTML tokenizer.
+    """
+    tokens = html.split()
+    ids = []
+    for tok in tokens:
+        idx = hash(tok) % HTML_VOCAB_SIZE
+        ids.append(idx)
 
-# Title and description
-st.title("🛡️ Phishing URL Detector")
-st.markdown("""
-This tool uses machine learning to detect potentially malicious phishing URLs.
-Simply paste a URL below to check if it's safe or suspicious.
-""")
+    if len(ids) < HTML_MAX_LEN:
+        ids = ids + [0] * (HTML_MAX_LEN - len(ids))
+    else:
+        ids = ids[:HTML_MAX_LEN]
 
-# Sidebar with info
-with st.sidebar:
-    st.header("ℹ️ About")
-    st.markdown("""
-    This detector analyzes:
-    - URL structure and patterns
-    - Suspicious keywords
-    - Domain characteristics
-    - Security indicators
+    return torch.tensor([ids], dtype=torch.long, device=DEVICE)
 
-    **Accuracy**: ~95% (on test data)
 
-    ⚠️ **Note**: Always exercise caution with unfamiliar links!
-    """)
+def predict(url: str):
+    html = fetch_html(url)
+    url_ids, normalized_url = encode_url(url)
+    html_ids = encode_html(html)
 
-    st.header("🔍 How it works")
-    st.markdown("""
-    1. Enter a URL
-    2. AI extracts 20+ features
-    3. Neural network classifies it
-    4. Get instant results!
-    """)
+    with torch.no_grad():
+        logits = model(url_ids, html_ids)
+        prob = torch.sigmoid(logits).item()
 
-# Main input area
-url_input = st.text_input(
-    "Enter URL to check:",
-    placeholder="https://example.com",
-    help="Paste any URL you want to verify"
+    label = "Phishing" if prob >= 0.5 else "Legitimate"
+    return normalized_url, prob, label, html
+
+
+# =========================
+# 4. STREAMLIT UI
+# =========================
+
+st.title("🕸️ WebPhish-Lite++")
+st.subheader("Phishing Website Detection (URL + HTML)")
+
+st.markdown(
+    """
+Enter a URL below and the model will:
+1. Fetch the HTML of the page  
+2. Encode the URL + HTML  
+3. Run them through your trained WebPhish-Lite++ model  
+4. Return a phishing probability and label
+"""
 )
 
-# Analyze button
-if st.button("🔍 Analyze URL", type="primary"):
-    if not url_input:
-        st.warning("⚠️ Please enter a URL first!")
-    else:
-        # Validate URL format
-        if not url_input.startswith(('http://', 'https://')):
-            url_input = 'https://' + url_input
+url_input = st.text_input(
+    "Website URL",
+    placeholder="example: https://secure-login-example.com",
+)
 
-        with st.spinner("🔄 Analyzing URL..."):
-            try:
-                # Extract features
-                features = extract_features(url_input)
+if st.button("Analyze URL") and url_input:
+    with st.spinner("Analyzing website..."):
+        normalized_url, prob, label, html = predict(url_input)
 
-                # Simulate model loading (in real deployment, load your trained model)
-                # model = URLClassifier(input_size=20)
-                # model.load_state_dict(torch.load('model.pth'))
-                # model.eval()
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            "Phishing probability",
+            f"{prob*100:.2f} %",
+        )
+    with col2:
+        st.metric("Prediction", label)
 
-                # For demo purposes, use heuristic-based scoring
-                # In production, replace this with: prediction = model(torch.tensor([features], dtype=torch.float32))
+    st.markdown("---")
+    with st.expander("Show normalized URL"):
+        st.code(normalized_url, language="text")
 
-                # Heuristic scoring (replace with actual model inference)
-                score = 0
-
-                # Check suspicious patterns
-                if features[6]:  # Has IP address
-                    score += 0.3
-                if not features[7]:  # Not HTTPS
-                    score += 0.2
-                if features[1] > 4:  # Too many dots
-                    score += 0.15
-                if any(features[10:15]):  # Has suspicious keywords
-                    score += 0.25
-                if features[0] > 75:  # Very long URL
-                    score += 0.1
-
-                # Convert to probability
-                phishing_probability = min(score, 0.95)
-
-                # Add some randomness for demo (remove in production)
-                import random
-
-                phishing_probability = max(0.05, min(0.95, phishing_probability + random.uniform(-0.1, 0.1)))
-
-                time.sleep(1)  # Simulate processing time
-
-                # Display results
-                st.markdown("---")
-                st.subheader("📊 Analysis Results")
-
-                # Create columns for metrics
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.metric(
-                        label="Phishing Probability",
-                        value=f"{phishing_probability * 100:.1f}%"
-                    )
-
-                with col2:
-                    if phishing_probability > 0.7:
-                        status = "🔴 HIGH RISK"
-                        color = "red"
-                    elif phishing_probability > 0.4:
-                        status = "🟡 SUSPICIOUS"
-                        color = "orange"
-                    else:
-                        status = "🟢 LIKELY SAFE"
-                        color = "green"
-
-                    st.metric(label="Status", value=status)
-
-                # Detailed verdict
-                st.markdown("### Verdict")
-
-                if phishing_probability > 0.7:
-                    st.error("""
-                    **⚠️ HIGH RISK - Likely Phishing**
-
-                    This URL shows strong indicators of being a phishing attempt. 
-                    **Do NOT enter any personal information!**
-                    """)
-                elif phishing_probability > 0.4:
-                    st.warning("""
-                    **⚠️ SUSPICIOUS - Exercise Caution**
-
-                    This URL has some suspicious characteristics. 
-                    Verify the source before proceeding.
-                    """)
-                else:
-                    st.success("""
-                    **✅ LIKELY SAFE**
-
-                    This URL appears to be legitimate based on our analysis.
-                    However, always stay vigilant online!
-                    """)
-
-                # Feature analysis
-                with st.expander("🔬 Detailed Feature Analysis"):
-                    st.markdown(f"""
-                    - **URL Length**: {features[0]} characters
-                    - **Uses HTTPS**: {'✅ Yes' if features[7] else '❌ No'}
-                    - **Has IP Address**: {'⚠️ Yes' if features[6] else '✅ No'}
-                    - **Number of Dots**: {features[1]}
-                    - **Domain Length**: {features[8]} characters
-                    - **Suspicious Keywords**: {'⚠️ Found' if any(features[10:15]) else '✅ None'}
-                    - **Number of Subdomains**: {features[9]}
-                    """)
-
-                # Safety tips
-                with st.expander("💡 Safety Tips"):
-                    st.markdown("""
-                    - Always verify the sender before clicking links
-                    - Check for HTTPS and valid certificates
-                    - Look for spelling errors in domain names
-                    - Never enter passwords on suspicious sites
-                    - Enable two-factor authentication
-                    - Report suspected phishing to authorities
-                    """)
-
-            except Exception as e:
-                st.error(f"❌ Error analyzing URL: {str(e)}")
-
-# Example URLs section
-st.markdown("---")
-st.subheader("🧪 Try These Examples")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("**Safe URLs:**")
-    if st.button("🟢 https://google.com"):
-        st.text_input("Enter URL to check:", value="https://google.com", key="safe1")
-    if st.button("🟢 https://github.com"):
-        st.text_input("Enter URL to check:", value="https://github.com", key="safe2")
-
-with col2:
-    st.markdown("**Suspicious Patterns:**")
-    if st.button("🔴 http://paypal-verify-account.xyz"):
-        st.text_input("Enter URL to check:", value="http://paypal-verify-account.xyz", key="phish1")
-    if st.button("🔴 https://192.168.1.1/login"):
-        st.text_input("Enter URL to check:", value="https://192.168.1.1/login", key="phish2")
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666;'>
-    <p>🛡️ Built with Streamlit & PyTorch | Stay Safe Online!</p>
-</div>
-""", unsafe_allow_html=True)
+    with st.expander("Show first 1500 characters of HTML"):
+        st.code(html[:1500], language="html")
+elif url_input:
+    st.info("Click 'Analyze URL' to run the model.")
