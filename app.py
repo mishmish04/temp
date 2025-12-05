@@ -1,5 +1,4 @@
 # app.py
-import os
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -15,75 +14,78 @@ st.set_page_config(
     layout="centered",
 )
 
-# Your actual file name from GitHub
-MODEL_PATH = "webphish_lite_complete.pth"
+# Change this to your actual filename in the repo
+MODEL_PATH = "webphish_lite_complete.pth"  # e.g. "checkpoint_webphish.pth"
 
 DEVICE = torch.device("cpu")
 
 # =========================
 # 1. MODEL DEFINITION
 # =========================
+# Paste the exact same architecture you used during training.
+# This example follows your described architecture.
 
 class WebPhishLitePP(nn.Module):
-    def __init__(
-        self,
-        url_vocab_size: int = 256,
-        html_vocab_size: int = 50000,
-        embed_dim: int = 16,
-    ):
-        super().__init__()
-        # URL + HTML embeddings
-        self.url_emb = nn.Embedding(url_vocab_size, embed_dim, padding_idx=0)
-        self.html_emb = nn.Embedding(html_vocab_size, embed_dim, padding_idx=0)
+    class WebPhishLitePP(nn.Module):
+        def __init__(
+                self,
+                url_vocab_size: int = 256,
+                html_vocab_size: int = 50000,
+                embed_dim: int = 32,  # ← FIXED: must be 32 to match checkpoint
+        ):
+            super().__init__()
 
-        # Multi-kernel Conv1D block over concatenated embeddings
-        self.conv3 = nn.Conv1d(embed_dim, 32, kernel_size=3, padding=1)
-        self.conv5 = nn.Conv1d(embed_dim, 32, kernel_size=5, padding=2)
-        self.conv7 = nn.Conv1d(embed_dim, 32, kernel_size=7, padding=3)
+            # URL + HTML embeddings
+            self.url_emb = nn.Embedding(url_vocab_size, embed_dim, padding_idx=0)
+            self.html_emb = nn.Embedding(html_vocab_size, embed_dim, padding_idx=0)
 
-        self.gelu = nn.GELU()
-        self.maxpool = nn.MaxPool1d(kernel_size=2)
-        # 32 filters * 3 kernels = 96 channels
-        self.layernorm = nn.LayerNorm(96)
-        self.dropout = nn.Dropout(0.3)
+            # Multi-kernel Conv1D block
+            # Each conv layer’s in_channels MUST MATCH embed_dim = 32
+            self.conv3 = nn.Conv1d(embed_dim, 32, kernel_size=3, padding=1)
+            self.conv5 = nn.Conv1d(embed_dim, 32, kernel_size=5, padding=2)
+            self.conv7 = nn.Conv1d(embed_dim, 32, kernel_size=7, padding=3)
 
-        self.fc1 = nn.Linear(96, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.out = nn.Linear(64, 1)
+            self.gelu = nn.GELU()
+            self.maxpool = nn.MaxPool1d(kernel_size=2)
 
-    def forward(self, url_ids, html_ids):
-        """
-        url_ids:  (batch, url_seq_len)  LongTensor
-        html_ids: (batch, html_seq_len) LongTensor
-        """
-        url_emb = self.url_emb(url_ids)    # (B, L_u, E)
-        html_emb = self.html_emb(html_ids) # (B, L_h, E)
+            # 32 filters × 3 kernel sizes → 96 channels
+            self.layernorm = nn.LayerNorm(96)
+            self.dropout = nn.Dropout(0.3)
 
-        # Concatenate along sequence dimension
-        x = torch.cat([url_emb, html_emb], dim=1)  # (B, L_u + L_h, E)
+            self.fc1 = nn.Linear(96, 128)
+            self.fc2 = nn.Linear(128, 64)
+            self.out = nn.Linear(64, 1)
 
-        # Conv1d expects (B, C_in, L)
-        x = x.transpose(1, 2)  # (B, E, L)
+        def forward(self, url_ids, html_ids):
+            url_emb = self.url_emb(url_ids)  # (B, L_u, 32)
+            html_emb = self.html_emb(html_ids)  # (B, L_h, 32)
 
-        x3 = self.gelu(self.conv3(x))
-        x5 = self.gelu(self.conv5(x))
-        x7 = self.gelu(self.conv7(x))
+            # concatenate sequence dimension
+            x = torch.cat([url_emb, html_emb], dim=1)  # (B, L_total, 32)
 
-        x = torch.cat([x3, x5, x7], dim=1)  # (B, 96, L)
-        x = self.maxpool(x)                 # (B, 96, L/2)
+            # Conv1d expects: (batch, channels, length)
+            x = x.transpose(1, 2)  # now (B, 32, L_total)
 
-        # Global average over sequence
-        x = x.mean(dim=-1)                  # (B, 96)
+            x3 = self.gelu(self.conv3(x))  # (B, 32, L)
+            x5 = self.gelu(self.conv5(x))  # (B, 32, L)
+            x7 = self.gelu(self.conv7(x))  # (B, 32, L)
 
-        x = self.layernorm(x)
-        x = self.dropout(self.gelu(self.fc1(x)))
-        x = self.dropout(self.gelu(self.fc2(x)))
-        logits = self.out(x)                # (B, 1)
-        return logits
+            # concat channels → 96 filters
+            x = torch.cat([x3, x5, x7], dim=1)  # (B, 96, L)
+
+            x = self.maxpool(x)  # (B, 96, L/2)
+            x = x.mean(dim=-1)  # global avg → (B, 96)
+
+            x = self.layernorm(x)
+            x = self.dropout(self.gelu(self.fc1(x)))
+            x = self.dropout(self.gelu(self.fc2(x)))
+            logits = self.out(x)
+
+            return logits
 
 
 # =========================
-# 2. GLOBAL HYPERPARAMS (CAN BE OVERRIDDEN BY CKPT)
+# 2. GLOBAL HYPERPARAMS (WILL BE OVERRIDDEN FROM CKPT)
 # =========================
 
 URL_MAX_LEN = 200
@@ -99,101 +101,48 @@ EMBED_DIM = 16
 @st.cache_resource
 def load_model():
     """
-    Tries hard to load your trained weights.
-    If anything fails, returns a randomly initialized WebPhishLitePP
-    and shows a warning instead of crashing the app.
+    Handles both:
+    - full model saved via torch.save(model, path)
+    - checkpoint dict saved via torch.save({
+          "model_state_dict": model.state_dict(),
+          "char_vocab_size": ...,
+          "word_vocab_size": ...,
+          "url_len": ...,
+          "html_len": ...,
+          "char_emb_dim": ...,
+          "word_emb_dim": ...
+      }, path)
     """
+    ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
+
+    # Case 1: full model object (no "model_state_dict" key)
+    if not (isinstance(ckpt, dict) and "model_state_dict" in ckpt):
+        model = ckpt
+        model.to(DEVICE)
+        model.eval()
+        return model
+
+    # Case 2: checkpoint dict (your logs show this case)
     global URL_MAX_LEN, HTML_MAX_LEN, URL_VOCAB_SIZE, HTML_VOCAB_SIZE, EMBED_DIM
 
-    # Base model (random weights)
+    URL_VOCAB_SIZE = ckpt.get("char_vocab_size", URL_VOCAB_SIZE)
+    HTML_VOCAB_SIZE = ckpt.get("word_vocab_size", HTML_VOCAB_SIZE)
+    URL_MAX_LEN = ckpt.get("url_len", URL_MAX_LEN)
+    HTML_MAX_LEN = ckpt.get("html_len", HTML_MAX_LEN)
+    EMBED_DIM = ckpt.get("char_emb_dim", EMBED_DIM)  # assuming char_emb_dim == word_emb_dim
+
     model = WebPhishLitePP(
         url_vocab_size=URL_VOCAB_SIZE,
         html_vocab_size=HTML_VOCAB_SIZE,
         embed_dim=EMBED_DIM,
     )
+    model.load_state_dict(ckpt["model_state_dict"])
     model.to(DEVICE)
-
-    if not os.path.exists(MODEL_PATH):
-        st.warning(
-            f"Model file '{MODEL_PATH}' not found in repo root. "
-            f"Using RANDOM weights (demo mode)."
-        )
-        model.eval()
-        return model
-
-    try:
-        ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
-    except Exception as e:
-        st.warning(
-            f"Could not load '{MODEL_PATH}' ({e}). "
-            f"Using RANDOM weights (demo mode)."
-        )
-        model.eval()
-        return model
-
-    # Case 1: full model object was saved
-    if isinstance(ckpt, nn.Module):
-        ckpt.to(DEVICE)
-        ckpt.eval()
-        return ckpt
-
-    # Case 2: checkpoint dict
-    if isinstance(ckpt, dict):
-        # If there's a full model inside the dict
-        if "model" in ckpt and isinstance(ckpt["model"], nn.Module):
-            m = ckpt["model"]
-            m.to(DEVICE)
-            m.eval()
-            return m
-
-        # If there's a state_dict plus meta info
-        if "model_state_dict" in ckpt:
-            # override hyperparams if present
-            URL_VOCAB_SIZE = ckpt.get("char_vocab_size", URL_VOCAB_SIZE)
-            HTML_VOCAB_SIZE = ckpt.get("word_vocab_size", HTML_VOCAB_SIZE)
-            URL_MAX_LEN = ckpt.get("url_len", URL_MAX_LEN)
-            HTML_MAX_LEN = ckpt.get("html_len", HTML_MAX_LEN)
-            EMBED_DIM = ckpt.get("char_emb_dim", EMBED_DIM)
-
-            model = WebPhishLitePP(
-                url_vocab_size=URL_VOCAB_SIZE,
-                html_vocab_size=HTML_VOCAB_SIZE,
-                embed_dim=EMBED_DIM,
-            ).to(DEVICE)
-
-            sd = ckpt["model_state_dict"]
-            try:
-                model.load_state_dict(sd)
-            except Exception:
-                # Last resort: strict=False
-                try:
-                    model.load_state_dict(sd, strict=False)
-                    st.warning(
-                        "Loaded weights with strict=False "
-                        "(some keys missing/unexpected)."
-                    )
-                except Exception as e2:
-                    st.warning(
-                        f"Could not load weights from state_dict ({e2}). "
-                        f"Using RANDOM weights (demo mode)."
-                    )
-                    model.eval()
-                    return model
-
-            model.eval()
-            return model
-
-    # If none of the above worked, fall back to random model
-    st.warning(
-        "Checkpoint format not recognized. "
-        "Using RANDOM weights (demo mode)."
-    )
     model.eval()
     return model
 
 
 model = load_model()
-
 
 # =========================
 # 4. PREPROCESSING
@@ -220,9 +169,10 @@ def fetch_html(url: str) -> str:
 def encode_url(url: str):
     """
     Simple character-level encoding.
-    This must roughly match training for good results.
+    Make sure this matches what you used during training.
     """
     url = url.strip()
+    # Ensure protocol so requests.get doesn't break
     parsed = urlparse(url)
     if not parsed.scheme:
         url = "http://" + url
@@ -232,6 +182,7 @@ def encode_url(url: str):
         idx = ord(ch) if ord(ch) < URL_VOCAB_SIZE else 0
         ids.append(idx)
 
+    # pad / truncate to URL_MAX_LEN (will be set from ckpt)
     if len(ids) < URL_MAX_LEN:
         ids = ids + [0] * (URL_MAX_LEN - len(ids))
     else:
@@ -242,7 +193,8 @@ def encode_url(url: str):
 
 def encode_html(html: str):
     """
-    Basic whitespace token -> hashed index.
+    Very basic whitespace token -> hashed index.
+    Adapt this to your actual HTML tokenizer if needed.
     """
     tokens = html.split()
     ids = []
@@ -284,7 +236,7 @@ Enter a URL below and the model will:
 
 1. Fetch the HTML of the page  
 2. Encode the URL + HTML  
-3. Run them through your WebPhish-Lite++ model  
+3. Run them through your trained WebPhish-Lite++ model  
 4. Return a phishing probability and label
 """
 )
@@ -296,25 +248,22 @@ url_input = st.text_input(
 
 if st.button("Analyze URL") and url_input:
     with st.spinner("Analyzing website..."):
-        try:
-            normalized_url, prob, label, html = predict(url_input)
-        except Exception as e:
-            st.error(f"Error during prediction: {e}")
-        else:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric(
-                    "Phishing probability",
-                    f"{prob*100:.2f} %",
-                )
-            with col2:
-                st.metric("Prediction", label)
+        normalized_url, prob, label, html = predict(url_input)
 
-            st.markdown("---")
-            with st.expander("Show normalized URL"):
-                st.code(normalized_url, language="text")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            "Phishing probability",
+            f"{prob*100:.2f} %",
+        )
+    with col2:
+        st.metric("Prediction", label)
 
-            with st.expander("Show first 1500 characters of HTML"):
-                st.code(html[:1500], language="html")
+    st.markdown("---")
+    with st.expander("Show normalized URL"):
+        st.code(normalized_url, language="text")
+
+    with st.expander("Show first 1500 characters of HTML"):
+        st.code(html[:1500], language="html")
 elif url_input:
     st.info("Click 'Analyze URL' to run the model.")
