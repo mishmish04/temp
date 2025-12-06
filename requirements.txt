@@ -2,4 +2,5 @@ streamlit
 torch
 beautifulsoup4
 requests
+scikit-learn
 lxml
