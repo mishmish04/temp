@@ -1,5 +1,5 @@
 streamlit
 torch
-requests
 beautifulsoup4
+requests
 lxml
