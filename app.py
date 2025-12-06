@@ -98,35 +98,45 @@ def get_trained_model():
     np.random.seed(42)
 
     # Generate benign URLs features (lower risk scores)
-    benign_samples = 500
-    benign_features = np.random.randn(benign_samples, 20)
-    benign_features[:, 0] = np.random.uniform(10, 50, benign_samples)  # shorter URLs
-    benign_features[:, 1] = np.random.uniform(5, 20, benign_samples)  # normal domain length
-    benign_features[:, 4] = np.random.choice([0, 1], benign_samples, p=[0.3, 0.7])  # mostly HTTPS
+    benign_samples = 600
+    benign_features = np.random.randn(benign_samples, 20) * 0.3
+    benign_features[:, 0] = np.random.uniform(10, 45, benign_samples)  # shorter URLs
+    benign_features[:, 1] = np.random.uniform(5, 18, benign_samples)  # normal domain length
+    benign_features[:, 4] = 1  # HTTPS enabled
     benign_features[:, 5] = 0  # no @ symbol
-    benign_features[:, 6] = np.random.uniform(0, 2, benign_samples)  # few suspicious keywords
-    benign_features[:, 7] = np.random.uniform(0, 2, benign_samples)  # few subdomains
+    benign_features[:, 6] = np.random.uniform(0, 0.5, benign_samples)  # very few suspicious keywords
+    benign_features[:, 7] = np.random.uniform(0, 1.5, benign_samples)  # few subdomains
+    benign_features[:, 9] = 0  # no IP address
+    benign_features[:, 17] = 1  # common TLD
 
     # Generate phishing URLs features (higher risk scores)
-    phishing_samples = 500
-    phishing_features = np.random.randn(phishing_samples, 20)
-    phishing_features[:, 0] = np.random.uniform(60, 150, phishing_samples)  # longer URLs
-    phishing_features[:, 1] = np.random.uniform(15, 40, phishing_samples)  # longer domains
-    phishing_features[:, 4] = np.random.choice([0, 1], phishing_samples, p=[0.6, 0.4])  # less HTTPS
-    phishing_features[:, 5] = np.random.choice([0, 1], phishing_samples, p=[0.7, 0.3])  # sometimes @ symbol
-    phishing_features[:, 6] = np.random.uniform(2, 5, phishing_samples)  # more suspicious keywords
-    phishing_features[:, 7] = np.random.uniform(2, 6, phishing_samples)  # more subdomains
+    phishing_samples = 600
+    phishing_features = np.random.randn(phishing_samples, 20) * 0.5
+    phishing_features[:, 0] = np.random.uniform(50, 120, phishing_samples)  # longer URLs
+    phishing_features[:, 1] = np.random.uniform(20, 50, phishing_samples)  # longer domains
+    phishing_features[:, 4] = np.random.choice([0, 1], phishing_samples, p=[0.7, 0.3])  # mostly no HTTPS
+    phishing_features[:, 5] = np.random.choice([0, 1], phishing_samples, p=[0.6, 0.4])  # sometimes @ symbol
+    phishing_features[:, 6] = np.random.uniform(2, 6, phishing_samples)  # many suspicious keywords
+    phishing_features[:, 7] = np.random.uniform(2, 5, phishing_samples)  # many subdomains
+    phishing_features[:, 9] = np.random.choice([0, 1], phishing_samples, p=[0.7, 0.3])  # sometimes IP
+    phishing_features[:, 17] = np.random.choice([0, 1], phishing_samples, p=[0.6, 0.4])  # often uncommon TLD
 
     # Combine data
     X_train = np.vstack([benign_features, phishing_features])
     y_train = np.hstack([np.zeros(benign_samples), np.ones(phishing_samples)])
 
-    # Train Random Forest
+    # Shuffle
+    indices = np.random.permutation(len(X_train))
+    X_train = X_train[indices]
+    y_train = y_train[indices]
+
+    # Train Random Forest with better parameters
     model = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=15,
-        min_samples_split=5,
-        min_samples_leaf=2,
+        n_estimators=150,
+        max_depth=20,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        class_weight='balanced',
         random_state=42
     )
     model.fit(X_train, y_train)
@@ -135,7 +145,7 @@ def get_trained_model():
 
 
 def predict_phishing(features, model):
-    """Predict if URL is phishing using Random Forest"""
+    """Predict if URL is phishing using Random Forest + Rule Boosting"""
     if features is None:
         return None, None, None
 
@@ -149,14 +159,47 @@ def predict_phishing(features, model):
     elif feature_vector.shape[1] > 20:
         feature_vector = feature_vector[:, :20]
 
-    # Get prediction and probability
-    prediction = model.predict(feature_vector)[0]
-    probability = model.predict_proba(feature_vector)[0]
+    # Get ML prediction and probability
+    ml_prediction = model.predict(feature_vector)[0]
+    ml_probability = model.predict_proba(feature_vector)[0]
 
-    # Get feature importance for this prediction
+    # Apply rule-based boosting for obvious phishing patterns
+    boost_score = 0
+
+    # Critical phishing indicators (heavily boost phishing probability)
+    if features['has_ip'] == 1:
+        boost_score += 0.4  # IP address is major red flag
+    if features['at_symbol'] == 1:
+        boost_score += 0.35  # @ symbol redirect
+    if features['suspicious_keywords'] >= 3:
+        boost_score += 0.3
+    elif features['suspicious_keywords'] >= 2:
+        boost_score += 0.2
+    if features['https'] == 0 and features['suspicious_keywords'] >= 1:
+        boost_score += 0.25  # No HTTPS + suspicious keywords
+    if features['subdomain_count'] > 3:
+        boost_score += 0.2
+    if features['is_shortened'] == 1:
+        boost_score += 0.15
+    if features['url_length'] > 75:
+        boost_score += 0.15
+    if features['common_tld'] == 0 and features['suspicious_keywords'] >= 1:
+        boost_score += 0.2  # Weird TLD + suspicious keywords
+    if features['prefix_suffix'] == 1 and features['suspicious_keywords'] >= 1:
+        boost_score += 0.15
+
+    # Adjust probability based on boost
+    adjusted_probability = ml_probability.copy()
+    adjusted_probability[1] = min(1.0, ml_probability[1] + boost_score)
+    adjusted_probability[0] = 1.0 - adjusted_probability[1]
+
+    # Final prediction based on adjusted probability
+    final_prediction = 1 if adjusted_probability[1] >= 0.5 else 0
+
+    # Get feature importance
     feature_importance = model.feature_importances_
 
-    return prediction, probability, feature_importance
+    return final_prediction, adjusted_probability, feature_importance
 
 
 # Streamlit UI
