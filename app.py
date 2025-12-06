@@ -51,14 +51,15 @@ class WebPhishLitePlusPlus(nn.Module):
     def __init__(self, char_vocab_size, word_vocab_size, embedding_dim=16):
         super().__init__()
 
-        # Embeddings
+        # Embeddings (16-dim each)
         self.url_embedding = nn.Embedding(char_vocab_size, embedding_dim)
         self.html_embedding = nn.Embedding(word_vocab_size, embedding_dim)
 
-        # Shared multi-kernel CNN (processes concatenated URL+HTML embeddings)
-        self.conv3 = nn.Conv1d(embedding_dim, 32, kernel_size=3, padding=1)
-        self.conv5 = nn.Conv1d(embedding_dim, 32, kernel_size=5, padding=2)
-        self.conv7 = nn.Conv1d(embedding_dim, 32, kernel_size=7, padding=3)
+        # Shared multi-kernel CNN (processes concatenated embeddings = 32 channels)
+        # After concatenating 16+16, we get 32 input channels
+        self.conv3 = nn.Conv1d(embedding_dim * 2, 32, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv1d(embedding_dim * 2, 32, kernel_size=5, padding=2)
+        self.conv7 = nn.Conv1d(embedding_dim * 2, 32, kernel_size=7, padding=3)
 
         self.gelu = nn.GELU()
         self.maxpool = nn.MaxPool1d(2)
@@ -113,7 +114,18 @@ class WebPhishLitePlusPlus(nn.Module):
 # Load model and vocabularies
 @st.cache_resource
 def load_artifacts():
+    import os
+
+    # Debug: Show available files
+    st.sidebar.write("📁 Available files:", os.listdir('.'))
+
     try:
+        # Check if vocab files exist
+        if not os.path.exists('char_vocab.pkl'):
+            raise FileNotFoundError("char_vocab.pkl not found")
+        if not os.path.exists('word_vocab.pkl'):
+            raise FileNotFoundError("word_vocab.pkl not found")
+
         # Load vocabularies
         with open('char_vocab.pkl', 'rb') as f:
             char_vocab_data = pickle.load(f)
@@ -123,34 +135,54 @@ def load_artifacts():
         char_to_idx = char_vocab_data['char_to_idx']
         word_to_idx = word_vocab_data['word_to_idx']
 
-        # Initialize model
-        model = WebPhishLitePlusPlus(len(char_to_idx), len(word_to_idx))
+        st.sidebar.write(f"✓ Vocabularies loaded")
+        st.sidebar.write(f"  Char vocab size: {len(char_to_idx)}")
+        st.sidebar.write(f"  Word vocab size: {len(word_to_idx)}")
+
+        # Initialize model with correct dimensions
+        model = WebPhishLitePlusPlus(len(char_to_idx), len(word_to_idx), embedding_dim=16)
 
         # Try loading different model files
         model_files = ['best_model.pth', 'webphish_lite_complete.pth']
         loaded_file = None
+        last_error = None
 
         for model_file in model_files:
-            try:
-                state_dict = torch.load(model_file, map_location=torch.device('cpu'))
+            if not os.path.exists(model_file):
+                st.sidebar.write(f"⚠️ {model_file} not found")
+                continue
 
-                # Handle different save formats
-                if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
-                    state_dict = state_dict['model_state_dict']
+            try:
+                st.sidebar.write(f"Trying to load {model_file}...")
+                checkpoint = torch.load(model_file, map_location=torch.device('cpu'))
+
+                # Handle webphish_lite_complete.pth format (nested dict)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    st.sidebar.write(f"  Format: nested checkpoint")
+                    state_dict = checkpoint['model_state_dict']
+                else:
+                    # Handle best_model.pth format (direct state_dict)
+                    st.sidebar.write(f"  Format: direct state_dict")
+                    state_dict = checkpoint
 
                 model.load_state_dict(state_dict)
                 model.eval()
                 loaded_file = model_file
+                st.sidebar.write(f"✓ Successfully loaded {model_file}")
                 break
             except Exception as e:
+                last_error = str(e)
+                st.sidebar.write(f"❌ Failed to load {model_file}: {str(e)[:150]}")
                 continue
 
         if loaded_file is None:
-            raise Exception("Could not load any model file")
+            error_msg = f"Could not load any model file. Last error: {last_error}"
+            raise Exception(error_msg)
 
         return model, char_to_idx, word_to_idx, loaded_file
 
     except Exception as e:
+        st.sidebar.error(f"Error details: {str(e)}")
         raise e
 
 
